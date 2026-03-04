@@ -1,7 +1,7 @@
 package com.example.assistivenavigation
 
 import android.content.Context
-import android.util.Log
+import android.graphics.*
 import androidx.camera.core.ImageProxy
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
@@ -10,22 +10,20 @@ import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import kotlin.math.*
+import androidx.core.graphics.createBitmap
 
 class Detector(context: Context) {
 
     companion object {
 
         private const val INPUT_SIZE = 320
-        private const val NUM_ATTR = 84
-        private const val NUM_ANCHORS = 2100
+        private const val NUM_DETECTIONS = 300
 
-        private const val OBJECTNESS_THRESHOLD = 0.35f
-        private const val CONF_THRESHOLD = 0.4f
-        private const val IOU_THRESHOLD = 0.45f
+        private const val CONF_THRESHOLD = 0.55f
+        private const val MAX_RESULTS = 5
 
-        private const val MAX_DETECTIONS = 5
-
-        private const val TEMPORAL_CONFIRM_FRAMES = 3
+        // temporal stabilization
+        private const val STABILITY_FRAMES = 3
     }
 
     private val interpreter: Interpreter
@@ -35,31 +33,32 @@ class Detector(context: Context) {
             .order(ByteOrder.nativeOrder())
 
     private val output =
-        Array(1) { Array(NUM_ATTR) { FloatArray(NUM_ANCHORS) } }
+        Array(1) { Array(NUM_DETECTIONS) { FloatArray(6) } }
 
-    // temporal smoothing
     private var previousBest: Detection? = null
-    private var stableFrames = 0
+    private var stableCount = 0
 
     init {
 
-        val model = loadModelFile(context, "yolov8n_int8.tflite")
+        val model = loadModelFile(context)
 
         val options = Interpreter.Options().apply {
+
             setNumThreads(4)
+
             setUseNNAPI(true)
-            setAllowFp16PrecisionForFp32(true)
+
         }
 
-        interpreter = Interpreter(model, options)
+        interpreter = Interpreter(model,options)
     }
 
     private fun loadModelFile(
-        context: Context,
-        name: String
+        context: Context
+
     ): MappedByteBuffer {
 
-        val fd = context.assets.openFd(name)
+        val fd = context.assets.openFd("yolov8n_float16.tflite")
 
         val input = FileInputStream(fd.fileDescriptor)
 
@@ -74,209 +73,159 @@ class Detector(context: Context) {
 
     fun detect(image: ImageProxy): List<Detection> {
 
-        val start = System.currentTimeMillis()
+        val bitmap = image.toBitmap()
 
-        preprocess(image)
+        val letterboxed = letterbox(bitmap)
 
-        inputBuffer.rewind()
+        bitmapToBuffer(letterboxed)
 
-        interpreter.run(inputBuffer, output)
+        interpreter.run(inputBuffer,output)
 
-        val detections = postprocess()
+        val detections = parseDetections()
 
-        val time = System.currentTimeMillis() - start
-
-        Log.d("YOLO_TIMING","Inference ${time}ms")
-
-        return detections
+        return stabilize(detections)
     }
 
-    private fun sigmoid(x:Float):Float =
-        1f/(1f+exp(-x))
+    // ---------------- LETTERBOX ----------------
 
-    // ---------------- PREPROCESS ----------------
+    private fun letterbox(src: Bitmap): Bitmap {
 
-    private fun preprocess(image:ImageProxy) {
+        val scale = min(
+            INPUT_SIZE.toFloat()/src.width,
+            INPUT_SIZE.toFloat()/src.height
+        )
+
+        val matrix = Matrix()
+
+        matrix.postScale(scale,scale)
+
+        val resized = Bitmap.createBitmap(
+            src,0,0,
+            src.width,src.height,
+            matrix,true
+        )
+
+        val padded = createBitmap(INPUT_SIZE, INPUT_SIZE)
+
+        val canvas = Canvas(padded)
+
+        val left = (INPUT_SIZE-resized.width)/2f
+        val top = (INPUT_SIZE-resized.height)/2f
+
+        canvas.drawBitmap(resized,left,top,null)
+
+        return padded
+    }
+
+    // ---------------- INPUT BUFFER ----------------
+
+    private fun bitmapToBuffer(bitmap: Bitmap){
 
         inputBuffer.rewind()
 
-        val yPlane = image.planes[0]
-        val uPlane = image.planes[1]
-        val vPlane = image.planes[2]
+        val pixels = IntArray(INPUT_SIZE*INPUT_SIZE)
 
-        val yBuf = yPlane.buffer
-        val uBuf = uPlane.buffer
-        val vBuf = vPlane.buffer
+        bitmap.getPixels(
+            pixels,0,INPUT_SIZE,
+            0,0,INPUT_SIZE,INPUT_SIZE
+        )
 
-        val yRowStride = yPlane.rowStride
-        val uvRowStride = uPlane.rowStride
-        val uvPixelStride = uPlane.pixelStride
+        for(pixel in pixels){
 
-        val width = image.width
-        val height = image.height
+            val r = ((pixel shr 16) and 0xFF)/255f
+            val g = ((pixel shr 8) and 0xFF)/255f
+            val b = (pixel and 0xFF)/255f
 
-        for (y in 0 until INPUT_SIZE) {
-
-            val srcY = y * height / INPUT_SIZE
-
-            for (x in 0 until INPUT_SIZE) {
-
-                val srcX = x * width / INPUT_SIZE
-
-                val yIndex = srcY * yRowStride + srcX
-
-                val uvIndex =
-                    (srcY/2)*uvRowStride +
-                            (srcX/2)*uvPixelStride
-
-                val Y = yBuf.get(yIndex).toInt() and 0xFF
-                val U = uBuf.get(uvIndex).toInt() and 0xFF
-                val V = vBuf.get(uvIndex).toInt() and 0xFF
-
-                val r = Y + 1.402f*(V-128)
-                val g = Y - 0.344f*(U-128) - 0.714f*(V-128)
-                val b = Y + 1.772f*(U-128)
-
-                inputBuffer.putFloat(r/255f)
-                inputBuffer.putFloat(g/255f)
-                inputBuffer.putFloat(b/255f)
-            }
+            inputBuffer.putFloat(r)
+            inputBuffer.putFloat(g)
+            inputBuffer.putFloat(b)
         }
     }
 
-    // ---------------- POSTPROCESS ----------------
+    // ---------------- PARSE OUTPUT ----------------
 
-    private fun postprocess():List<Detection> {
+    private fun parseDetections(): List<Detection> {
 
-        val rawDetections = ArrayList<Detection>()
+        val detections = mutableListOf<Detection>()
 
-        for (a in 0 until NUM_ANCHORS) {
+        for (i in 0 until NUM_DETECTIONS) {
 
-            val objectness =
-                sigmoid(output[0][4][a])
+            val score = output[0][i][4]
 
-            if (objectness < OBJECTNESS_THRESHOLD)
-                continue
+            if (score < CONF_THRESHOLD) continue
 
-            var bestClass = -1
-            var bestScore = 0f
+            val x1 = output[0][i][0]
+            val y1 = output[0][i][1]
 
-            for (c in 5 until NUM_ATTR) {
+            val x2 = output[0][i][2]
+            val y2 = output[0][i][3]
 
-                val score =
-                    sigmoid(output[0][c][a])
+            val cls = output[0][i][5].toInt()
 
-                if (score > bestScore) {
-                    bestScore = score
-                    bestClass = c-5
-                }
-            }
+            val cx = (x1+x2)/2f
 
-            val confidence = objectness*bestScore
 
-            if (confidence < CONF_THRESHOLD)
-                continue
+            val width = x2-x1
+            val height = y2-y1
 
-            // decode box (pixel → normalized)
+            val area = width*height
 
-            val cx =
-                output[0][0][a] / INPUT_SIZE
+            val centerDist = abs(cx-0.5f)
 
-            val cy =
-                output[0][1][a] / INPUT_SIZE
+            val centerWeight = 1f-centerDist
 
-            val w =
-                output[0][2][a] / INPUT_SIZE
+            val priority = score*area*centerWeight
 
-            val h =
-                output[0][3][a] / INPUT_SIZE
-
-            val x1 = (cx - w/2).coerceIn(0f,1f)
-            val y1 = (cy - h/2).coerceIn(0f,1f)
-
-            val x2 = (cx + w/2).coerceIn(0f,1f)
-            val y2 = (cy + h/2).coerceIn(0f,1f)
-
-            rawDetections.add(
+            detections.add(
                 Detection(
-                    x1,y1,x2,y2,
-                    confidence,
-                    bestClass
+                    x1.coerceIn(0f,1f),
+                    y1.coerceIn(0f,1f),
+                    x2.coerceIn(0f,1f),
+                    y2.coerceIn(0f,1f),
+                    score,
+                    cls,
+                    priority
                 )
             )
         }
 
-        val filtered = nms(rawDetections)
-
-        val prioritized =
-            filtered.sortedByDescending {
-
-                val width = it.x2-it.x1
-                val height = it.y2-it.y1
-                val size = width*height
-
-                val center =
-                    abs((it.x1+it.x2)/2f - 0.5f)
-
-                size * (1f-center)
-            }
-
-        val best = prioritized.firstOrNull()
-
-        if (best != null) {
-
-            if (previousBest != null &&
-                iou(best,previousBest!!) > 0.5f) {
-
-                stableFrames++
-
-            } else {
-
-                stableFrames = 1
-            }
-
-            previousBest = best
-        }
-
-        if (stableFrames < TEMPORAL_CONFIRM_FRAMES)
-            return emptyList()
-
-        return prioritized.take(MAX_DETECTIONS)
+        return detections
+            .sortedByDescending { it.priority }
+            .take(MAX_RESULTS)
     }
 
-    // ---------------- NMS ----------------
+    // ---------------- STABILIZER ----------------
 
-    private fun nms(
-        detections:List<Detection>
-    ):List<Detection>{
+    private fun stabilize(
+        detections: List<Detection>
+    ): List<Detection> {
 
-        val sorted =
-            detections.sortedByDescending { it.score }
+        val best = detections.firstOrNull()
 
-        val result = ArrayList<Detection>()
+        if (best == null) {
 
-        val active = BooleanArray(sorted.size){true}
+            previousBest = null
+            stableCount = 0
 
-        for (i in sorted.indices) {
-
-            if (!active[i]) continue
-
-            val a = sorted[i]
-
-            result.add(a)
-
-            for (j in i+1 until sorted.size) {
-
-                if (!active[j]) continue
-
-                val b = sorted[j]
-
-                if (iou(a,b) > IOU_THRESHOLD)
-                    active[j] = false
-            }
+            return emptyList()
         }
 
-        return result
+        if (previousBest != null &&
+            iou(best,previousBest!!) > 0.5f) {
+
+            stableCount++
+
+        } else {
+
+            stableCount = 1
+        }
+
+        previousBest = best
+
+        if (stableCount < STABILITY_FRAMES)
+            return emptyList()
+
+        return detections
     }
 
     private fun iou(a:Detection,b:Detection):Float{
@@ -287,24 +236,25 @@ class Detector(context: Context) {
         val x2 = min(a.x2,b.x2)
         val y2 = min(a.y2,b.y2)
 
-        val inter =
-            max(0f,x2-x1)*max(0f,y2-y1)
+        val inter = max(0f,x2-x1)*max(0f,y2-y1)
 
-        val areaA =
-            (a.x2-a.x1)*(a.y2-a.y1)
-
-        val areaB =
-            (b.x2-b.x1)*(b.y2-b.y1)
+        val areaA = (a.x2-a.x1)*(a.y2-a.y1)
+        val areaB = (b.x2-b.x1)*(b.y2-b.y1)
 
         return inter/(areaA+areaB-inter+1e-6f)
     }
 
     data class Detection(
+
         val x1:Float,
         val y1:Float,
         val x2:Float,
         val y2:Float,
+
         val score:Float,
-        val cls:Int
+
+        val cls:Int,
+
+        val priority:Float
     )
 }
