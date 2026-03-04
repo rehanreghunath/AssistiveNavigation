@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">assistivenavigation</string>
+    <string name="debug_detection">
+    Inference: %1$d ms
+    Score: %2$.3f
+    Azimuth: %3$.1f°
+    Box: %4$.2f x %5$.2f
+    </string>
+
+    <string name="debug_no_detection">
+    Inference: %1$d ms
+    No object detected
+    </string>
+</resources>
