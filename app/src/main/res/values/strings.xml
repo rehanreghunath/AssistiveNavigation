@@ -11,4 +11,9 @@
     Inference: %1$d ms
     No object detected
     </string>
+
+    <string name="waiting">Waiting...</string>
+    <string name="start">START</string>
+    <string name="stop">STOP</string>
+    <string name="no_detection">No detection</string>
 </resources>

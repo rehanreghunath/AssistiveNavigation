@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
+import android.util.Size
+import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import androidx.activity.ComponentActivity
@@ -11,6 +13,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.*
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -22,21 +25,26 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var previewView: PreviewView
     private lateinit var startButton: Button
-
     private lateinit var overlayView: OverlayView
     private lateinit var debugOverlay: TextView
 
     private lateinit var detector: Detector
-
     private lateinit var audioEngine: AudioEngine
 
     private var smoothedAzimuth = 0f
     private var lastUIUpdate = 0L
-    private var wasDetecting = false
     private var lastAudioUpdateTime = 0L
+
+    private var systemRunning = false
+    private var audioStarted = false
+
+    private var confirmedFrames = 0
+    private val REQUIRED_CONFIRM_FRAMES = 5
 
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     private val isProcessing = AtomicBoolean(false)
+
+    private var cameraProvider: ProcessCameraProvider? = null
 
     private val cameraPermissionLauncher =
         registerForActivityResult(
@@ -57,12 +65,48 @@ class MainActivity : ComponentActivity() {
         startButton = findViewById(R.id.startButton)
 
         detector = Detector(this)
-
         audioEngine = AudioEngine()
 
+        previewView.visibility = View.INVISIBLE
+        debugOverlay.setText(R.string.waiting)
+
         startButton.setOnClickListener {
-            checkPermissionAndStart()
-            audioEngine.nativeStart()
+
+            if (!systemRunning) {
+
+                systemRunning = true
+                startButton.setText(R.string.stop)
+
+                previewView.visibility = View.VISIBLE
+                debugOverlay.text = ""
+
+                checkPermissionAndStart()
+
+            } else {
+
+                stopSystem()
+            }
+        }
+    }
+
+    private fun stopSystem() {
+
+        systemRunning = false
+        startButton.setText(R.string.start)
+
+        cameraProvider?.unbindAll()
+
+        previewView.visibility = View.INVISIBLE
+
+        overlayView.updateDetections(emptyList())
+
+        debugOverlay.setText(R.string.waiting)
+
+        confirmedFrames = 0
+
+        if (audioStarted) {
+            audioEngine.nativeStop()
+            audioStarted = false
         }
     }
 
@@ -83,7 +127,7 @@ class MainActivity : ComponentActivity() {
 
         cameraProviderFuture.addListener({
 
-            val cameraProvider = cameraProviderFuture.get()
+            cameraProvider = cameraProviderFuture.get()
 
             val preview = Preview.Builder()
                 .build()
@@ -101,14 +145,18 @@ class MainActivity : ComponentActivity() {
                             AspectRatioStrategy.FALLBACK_RULE_AUTO
                         )
                     )
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(1280, 720),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                        )
+                    )
                     .build()
 
             val imageAnalysis =
                 ImageAnalysis.Builder()
                     .setResolutionSelector(resolutionSelector)
-                    .setBackpressureStrategy(
-                        ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
-                    )
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
 
             imageAnalysis.setAnalyzer(
@@ -118,9 +166,9 @@ class MainActivity : ComponentActivity() {
             val cameraSelector =
                 CameraSelector.DEFAULT_BACK_CAMERA
 
-            cameraProvider.unbindAll()
+            cameraProvider?.unbindAll()
 
-            cameraProvider.bindToLifecycle(
+            cameraProvider?.bindToLifecycle(
                 this,
                 cameraSelector,
                 preview,
@@ -131,6 +179,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun analyzeFrame(image: ImageProxy) {
+
+        if (!systemRunning) {
+            image.close()
+            return
+        }
 
         if (!isProcessing.compareAndSet(false, true)) {
             image.close()
@@ -147,13 +200,29 @@ class MainActivity : ComponentActivity() {
         val primaryDetection =
             detections.firstOrNull()
 
+        if (primaryDetection != null) {
+            confirmedFrames++
+        } else {
+            confirmedFrames = 0
+        }
+
+        val confirmedDetection =
+            if (confirmedFrames >= REQUIRED_CONFIRM_FRAMES)
+                primaryDetection
+            else null
+
         if (startTime - lastAudioUpdateTime > 150) {
 
-            if (primaryDetection != null) {
+            if (confirmedDetection != null) {
+
+                if (!audioStarted) {
+                    audioEngine.nativeStart()
+                    audioStarted = true
+                }
 
                 val cx =
-                    (primaryDetection.x1 +
-                            primaryDetection.x2) / 2f
+                    (confirmedDetection.x1 +
+                            confirmedDetection.x2) / 2f
 
                 val normalized =
                     cx * 2f - 1f
@@ -166,8 +235,8 @@ class MainActivity : ComponentActivity() {
                             0.2f * rawAzimuth
 
                 val width =
-                    primaryDetection.x2 -
-                            primaryDetection.x1
+                    confirmedDetection.x2 -
+                            confirmedDetection.x1
 
                 val distance =
                     max(0.5f, 2.0f - width)
@@ -176,6 +245,13 @@ class MainActivity : ComponentActivity() {
                     smoothedAzimuth,
                     distance
                 )
+
+            } else {
+
+                if (audioStarted) {
+                    audioEngine.nativeStop()
+                    audioStarted = false
+                }
             }
 
             lastAudioUpdateTime = startTime
@@ -189,34 +265,25 @@ class MainActivity : ComponentActivity() {
 
                 lastUIUpdate = System.currentTimeMillis()
 
-                if (primaryDetection != null) {
+                if (confirmedDetection != null) {
 
                     val width =
-                        primaryDetection.x2 -
-                                primaryDetection.x1
+                        confirmedDetection.x2 -
+                                confirmedDetection.x1
 
                     val height =
-                        primaryDetection.y2 -
-                                primaryDetection.y1
+                        confirmedDetection.y2 -
+                                confirmedDetection.y1
 
                     debugOverlay.text =
                         getString(
                             R.string.debug_detection,
                             inferenceTime,
-                            primaryDetection.score,
+                            confirmedDetection.score,
                             smoothedAzimuth,
                             width,
                             height
                         )
-
-                    if (!wasDetecting) {
-                        Log.d(
-                            "YOLO_RESULT",
-                            "Detection started"
-                        )
-                    }
-
-                    wasDetecting = true
 
                 } else {
 
@@ -225,15 +292,6 @@ class MainActivity : ComponentActivity() {
                             R.string.debug_no_detection,
                             inferenceTime
                         )
-
-                    if (wasDetecting) {
-                        Log.d(
-                            "YOLO_RESULT",
-                            "Detection lost"
-                        )
-                    }
-
-                    wasDetecting = false
                 }
             }
         }
@@ -246,7 +304,9 @@ class MainActivity : ComponentActivity() {
 
         super.onDestroy()
 
-        audioEngine.nativeStop()
+        if (audioStarted) {
+            audioEngine.nativeStop()
+        }
 
         cameraExecutor.shutdown()
     }

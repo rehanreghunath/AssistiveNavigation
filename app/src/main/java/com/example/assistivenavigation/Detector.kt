@@ -19,8 +19,8 @@ class Detector(context: Context) {
         private const val INPUT_SIZE = 320
         private const val NUM_DETECTIONS = 300
 
-        private const val CONF_THRESHOLD = 0.55f
-        private const val MAX_RESULTS = 5
+        private const val CONF_THRESHOLD = 0.25f
+        private const val MAX_RESULTS = 10
 
         // temporal stabilization
         private const val STABILITY_FRAMES = 3
@@ -174,7 +174,7 @@ class Detector(context: Context) {
 
             val centerWeight = 1f-centerDist
 
-            val priority = score*area*centerWeight
+             val priority = score * (0.7f * area + 0.3f * centerWeight)
 
             detections.add(
                 Detection(
