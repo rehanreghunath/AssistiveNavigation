@@ -81,6 +81,7 @@ dependencies {
     implementation(libs.lifecycle.runtime.ktx)
     implementation("com.google.oboe:oboe:1.8.1")
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
+    implementation("org.opencv:opencv:4.10.0")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
