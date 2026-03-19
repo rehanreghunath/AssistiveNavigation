@@ -2,7 +2,10 @@ package com.example.assistivenavigation
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.os.Bundle
+import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
 import android.view.View
@@ -10,20 +13,25 @@ import android.widget.Button
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.camera.view.RotationProvider
 import androidx.core.content.ContextCompat
 import org.opencv.android.OpenCVLoader
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import com.example.assistivenavigation.Constants.MODEL_PATH
+import com.example.assistivenavigation.Constants.LABELS_PATH
 import kotlin.math.max
+import androidx.core.graphics.createBitmap
+import kotlin.collections.emptyList
 
-class MainActivity : ComponentActivity() {
-
+class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private lateinit var previewView: PreviewView
     private lateinit var startButton: Button
     private lateinit var overlayView: OverlayView
@@ -32,7 +40,6 @@ class MainActivity : ComponentActivity() {
     private lateinit var detector: Detector
     private lateinit var audioEngine: AudioEngine
 
-    // Optical flow and IMU
     private lateinit var opticalFlowProcessor: OpticalFlowProcessor
     private lateinit var imuProcessor: IMUProcessor
 
@@ -67,12 +74,11 @@ class MainActivity : ComponentActivity() {
         debugOverlay  = findViewById(R.id.debugOverlay)
         startButton   = findViewById(R.id.startButton)
 
-        detector      = Detector(this)
-        audioEngine   = AudioEngine()
+        detector    = Detector(baseContext, MODEL_PATH, LABELS_PATH, this)
+        audioEngine = AudioEngine()
 
-        // Instantiate here; start/stop with the session
         opticalFlowProcessor = OpticalFlowProcessor()
-        imuProcessor         = IMUProcessor(this)
+        imuProcessor = IMUProcessor(this)
 
         previewView.visibility = View.INVISIBLE
         debugOverlay.setText(R.string.waiting)
@@ -153,23 +159,25 @@ class MainActivity : ComponentActivity() {
 
         val startTime = System.currentTimeMillis()
 
-        // Capture dimensions NOW -> before image.close() makes them unavailable
         val imgW = image.width
         val imgH = image.height
 
-        // Extract gray BEFORE calling detect().
-        // Both operations read from image.planes[]; extractGray only touches
-        // the Y plane, detect() calls image.toBitmap() which reads all planes.
-        // Extracting first is fine because neither call closes the image.
         val grayMat = opticalFlowProcessor.extractGray(image)
 
-        // Run YOLO detection
-        val detections = detector.detect(image)
+        val bitmapBuffer = image.toBitmap()
 
-        // Run optical flow with the same frame's gray mat + detection results.
-        // Process() returns immediately if it's the very first frame.
+        val matrix = Matrix().apply {
+            postRotate(image.imageInfo.rotationDegrees.toFloat())
+        }
+
+        val rotatedBitmap = Bitmap.createBitmap(
+            bitmapBuffer, 0, 0, bitmapBuffer.width, bitmapBuffer.height,
+            matrix, true
+        )
+        val detections = detector.detect(rotatedBitmap)
+
         val flowResult = opticalFlowProcessor.process(grayMat, detections, imgW, imgH)
-        grayMat.release()   // IMPORTANT: release the OpenCV Mat
+        grayMat.release()
 
         val inferenceTime = System.currentTimeMillis() - startTime
 
@@ -197,36 +205,24 @@ class MainActivity : ComponentActivity() {
             lastAudioUpdateTime = startTime
         }
 
-        // ---- UI update----
-        runOnUiThread {
-            overlayView.updateDetections(detections)
-            overlayView.updateFlow(flowResult.points, imgW, imgH)   // NEW
 
-            if (System.currentTimeMillis() - lastUIUpdate > 200) {
-                lastUIUpdate = System.currentTimeMillis()
-
-                if (confirmedDetection != null) {
-                    val w = confirmedDetection.x2 - confirmedDetection.x1
-                    val h = confirmedDetection.y2 - confirmedDetection.y1
-
-                    // Include flow and speed in debug text
-                    val objFlow = flowResult.objectFlowMagnitudes[0] ?: 0f
-                    debugOverlay.text = getString(
-                        R.string.debug_detection,
-                        inferenceTime,
-                        confirmedDetection.score,
-                        smoothedAzimuth,
-                        w, h
-                    ) + "\nflow=%.1fpx spd=%.2fm/s".format(objFlow, imuProcessor.speed)
-                } else {
-                    debugOverlay.text = getString(R.string.debug_no_detection, inferenceTime) +
-                            "\nspd=%.2fm/s".format(imuProcessor.speed)
-                }
-            }
-        }
 
         image.close()
         isProcessing.set(false)
+    }
+
+    override fun onEmptyDetect() {
+        runOnUiThread {
+            overlayView.updateDetections(emptyList())
+            overlayView.updateFlow(emptyList(), 1, 1)
+        }
+    }
+
+    override fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long) {
+        runOnUiThread {
+            overlayView.updateDetections(boundingBoxes)
+            debugOverlay.text = "${inferenceTime}ms · ${boundingBoxes.size} obj"
+        }
     }
 
     override fun onDestroy() {
@@ -236,4 +232,5 @@ class MainActivity : ComponentActivity() {
         opticalFlowProcessor.release()
         cameraExecutor.shutdown()
     }
+
 }

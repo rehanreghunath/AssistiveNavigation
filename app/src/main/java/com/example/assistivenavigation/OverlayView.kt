@@ -43,7 +43,7 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
     }
 
     // ---- State ----
-    private var detections: List<Detector.Detection> = emptyList()
+    private var detections: List<BoundingBox> = emptyList()
     private var flowPoints: List<OpticalFlowProcessor.FlowPoint> = emptyList()
 
     /**
@@ -62,7 +62,7 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
     private val FLOW_SCALE_PIXELS  = 20f
     private val MIN_CIRCLE_RADIUS  = 3f    // always at least a visible dot
 
-    fun updateDetections(results: List<Detector.Detection>) {
+    fun updateDetections(results: List<BoundingBox>) {
         detections = results
         invalidate()   // Redraw the view
     }
@@ -112,12 +112,7 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
             val bottom = det.y2 * height
 
             canvas.drawRect(left, top, right, bottom, boxPaint)
-            canvas.drawText(
-                "%.2f".format(det.score),
-                left + 4f,
-                top - 12f,
-                textPaint
-            )
+
         }
     }
 }

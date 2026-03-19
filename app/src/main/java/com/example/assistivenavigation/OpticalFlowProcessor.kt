@@ -178,7 +178,7 @@ class OpticalFlowProcessor {
      */
     fun process(
         gray: Mat,
-        detections: List<Detector.Detection>,
+        detections: List<BoundingBox>,
         origW: Int,
         origH: Int
     ): FlowResult {
