@@ -16,4 +16,5 @@
     <string name="start">START</string>
     <string name="stop">STOP</string>
     <string name="no_detection">No detection</string>
+    <string name="upload">UPLOAD</string>
 </resources>

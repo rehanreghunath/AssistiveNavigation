@@ -4,14 +4,13 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.media.MediaMetadataRetriever
 import android.os.Bundle
-import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
-import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
@@ -20,7 +19,6 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.camera.view.RotationProvider
 import androidx.core.content.ContextCompat
 import org.opencv.android.OpenCVLoader
 import java.util.concurrent.Executors
@@ -28,14 +26,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 import com.example.assistivenavigation.Constants.MODEL_PATH
 import com.example.assistivenavigation.Constants.LABELS_PATH
 import kotlin.math.max
-import androidx.core.graphics.createBitmap
 import kotlin.collections.emptyList
 
-class MainActivity : AppCompatActivity(), Detector.DetectorListener {
+class MainActivity : AppCompatActivity() {
     private lateinit var previewView: PreviewView
     private lateinit var startButton: Button
+    private lateinit var uploadButton: Button
     private lateinit var overlayView: OverlayView
     private lateinit var debugOverlay: TextView
+    private lateinit var videoFrameView: android.widget.ImageView
+    private var videoRunning = false
+    private var videoTestJob: java.util.concurrent.Future<*>? = null
 
     private lateinit var detector: Detector
     private lateinit var audioEngine: AudioEngine
@@ -63,6 +64,18 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             if (granted) startCamera() else finish()
         }
 
+    private val videoPicker =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+            uri ?: return@registerForActivityResult
+            // Resolve to a file path the retriever can open
+            val path = getRealPathFromUri(uri)
+            if (path != null) startVideoTest(path)
+            else {
+                // Fallback: pass the Uri directly via FileDescriptor
+                startVideoTestFromUri(uri)
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -73,15 +86,24 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         overlayView   = findViewById(R.id.overlayView)
         debugOverlay  = findViewById(R.id.debugOverlay)
         startButton   = findViewById(R.id.startButton)
+        uploadButton  = findViewById(R.id.uploadButton)
 
-        detector    = Detector(baseContext, MODEL_PATH, LABELS_PATH, this)
+        detector    = Detector(baseContext, MODEL_PATH, LABELS_PATH)
         audioEngine = AudioEngine()
-
         opticalFlowProcessor = OpticalFlowProcessor()
         imuProcessor = IMUProcessor(this)
 
         previewView.visibility = View.INVISIBLE
+        videoFrameView = findViewById(R.id.videoFrameView)
         debugOverlay.setText(R.string.waiting)
+
+        uploadButton.setOnClickListener {
+            if(!videoRunning){
+                videoPicker.launch("video/*")
+            } else {
+                stopVideoTest()
+            }
+        }
 
         startButton.setOnClickListener {
             if (!systemRunning) {
@@ -205,29 +227,167 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             lastAudioUpdateTime = startTime
         }
 
+        // ---- UI update ----
+        runOnUiThread {
+            overlayView.updateDetections(detections)
+            overlayView.updateFlow(flowResult.points, imgW, imgH)
 
+            if (System.currentTimeMillis() - lastUIUpdate > 200) {
+                lastUIUpdate = System.currentTimeMillis()
+                debugOverlay.text = if (confirmedDetection != null) {
+                    val objFlow = flowResult.objectFlowMagnitudes[0] ?: 0f
+                    getString(
+                        R.string.debug_detection,
+                        inferenceTime,
+                        confirmedDetection.cnf,
+                        smoothedAzimuth,
+                        confirmedDetection.x2 - confirmedDetection.x1,
+                        confirmedDetection.y2 - confirmedDetection.y1
+                    ) + "\nflow=%.1fpx spd=%.2fm/s".format(objFlow, imuProcessor.speed)
+                } else {
+                    getString(R.string.debug_no_detection, inferenceTime) +
+                            "\nspd=%.2fm/s".format(imuProcessor.speed)
+                }
+            }
+        }
 
         image.close()
         isProcessing.set(false)
     }
 
-    override fun onEmptyDetect() {
+    private fun startVideoTest(path: String) {
+        prepareVideoTest()
+        videoTestJob = cameraExecutor.submit { runVideoTest(path, null) }
+    }
+
+    private fun startVideoTestFromUri(uri: android.net.Uri) {
+        prepareVideoTest()
+        videoTestJob = cameraExecutor.submit { runVideoTest(null, uri) }
+    }
+
+    private fun prepareVideoTest() {
+        // Stop camera if running
+        if (systemRunning) stopSystem()
+
+        videoRunning = true
+        uploadButton.setText(R.string.stop)
+        opticalFlowProcessor.release()
+        confirmedFrames = 0
+        previewView.visibility = View.INVISIBLE // no camera preview
+        videoFrameView.visibility = View.VISIBLE
+        debugOverlay.text = "Loading video..."
+    }
+
+    private fun stopVideoTest() {
+        videoRunning = false
+        videoTestJob?.cancel(true)
+        videoTestJob = null
+        uploadButton.setText(R.string.upload)
+        if (audioStarted) { audioEngine.nativeStop(); audioStarted = false }
+        opticalFlowProcessor.release()
+        confirmedFrames = 0
         runOnUiThread {
+            videoFrameView.visibility = View.GONE
             overlayView.updateDetections(emptyList())
             overlayView.updateFlow(emptyList(), 1, 1)
+            debugOverlay.setText(R.string.waiting)
         }
     }
 
-    override fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long) {
-        runOnUiThread {
-            overlayView.updateDetections(boundingBoxes)
-            debugOverlay.text = "${inferenceTime}ms · ${boundingBoxes.size} obj"
+    private fun runVideoTest(path: String?, uri: android.net.Uri?) {
+        val retriever = MediaMetadataRetriever()
+        if (path != null) retriever.setDataSource(path)
+        else              retriever.setDataSource(this, uri)
+
+        val durationMs = retriever
+            .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            ?.toLong() ?: run { retriever.release(); return }
+
+        val frameIntervalMs = 1000L / 30L  // 30fps
+        var timeMs = 0L
+        var lastFrameRealTime = System.currentTimeMillis()
+
+        while (videoRunning && timeMs < durationMs) {
+            val frame = retriever.getFrameAtTime(
+                timeMs * 1000L,
+                MediaMetadataRetriever.OPTION_CLOSEST
+            )
+            if (frame == null) {
+                timeMs += frameIntervalMs
+                continue
+            }
+
+            runOnUiThread { videoFrameView.setImageBitmap(frame) }
+
+            val imgW = frame.width
+            val imgH = frame.height
+
+            val grayMat = bitmapToGrayMat(frame)
+            val detections = detector.detect(frame)
+            val flowResult = opticalFlowProcessor.process(grayMat, detections, imgW, imgH)
+            grayMat.release()
+
+            if (detections.firstOrNull() != null) confirmedFrames++ else confirmedFrames = 0
+            val confirmedDetection =
+                if (confirmedFrames >= REQUIRED_CONFIRM_FRAMES) detections.firstOrNull() else null
+
+            if (confirmedDetection != null) {
+                if (!audioStarted) { audioEngine.nativeStart(); audioStarted = true }
+                val cx = (confirmedDetection.x1 + confirmedDetection.x2) / 2f
+                val rawAzimuth = (cx * 2f - 1f) * 60f
+                smoothedAzimuth = 0.8f * smoothedAzimuth + 0.2f * rawAzimuth
+                val width = confirmedDetection.x2 - confirmedDetection.x1
+                audioEngine.nativeSetSpatialParams(smoothedAzimuth, maxOf(0.5f, 2.0f - width))
+            } else {
+                if (audioStarted) { audioEngine.nativeStop(); audioStarted = false }
+            }
+
+            runOnUiThread {
+                overlayView.updateDetections(detections)
+                overlayView.updateFlow(flowResult.points, imgW, imgH)
+                debugOverlay.text = if (confirmedDetection != null)
+                    "${confirmedDetection.clsName} az=%.1f°".format(smoothedAzimuth)
+                else
+                    "no detection · frame ${flowResult.frameCount}"
+            }
+
+            val now = System.currentTimeMillis()
+            val elapsed = now - lastFrameRealTime
+            val framesToSkip = (elapsed / frameIntervalMs).coerceAtLeast(1)
+            timeMs += frameIntervalMs * framesToSkip
+            lastFrameRealTime = now
         }
+
+        retriever.release()
+        runOnUiThread { if (videoRunning) stopVideoTest() }
+    }
+
+    private fun bitmapToGrayMat(bitmap: android.graphics.Bitmap): org.opencv.core.Mat {
+        val rgba = org.opencv.core.Mat()
+        org.opencv.android.Utils.bitmapToMat(bitmap, rgba)
+        val gray = org.opencv.core.Mat()
+        org.opencv.imgproc.Imgproc.cvtColor(rgba, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
+        rgba.release()
+        return gray
+    }
+
+    // Resolves content:// Uri to a real file path where possible
+    private fun getRealPathFromUri(uri: android.net.Uri): String? {
+        var path: String? = null
+        val projection = arrayOf(android.provider.MediaStore.Video.Media.DATA)
+        contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val col = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Video.Media.DATA)
+                path = cursor.getString(col)
+            }
+        }
+        return path
     }
 
     override fun onDestroy() {
         super.onDestroy()
         if (audioStarted) audioEngine.nativeStop()
+        videoTestJob?.cancel(true)
         imuProcessor.stop()
         opticalFlowProcessor.release()
         cameraExecutor.shutdown()

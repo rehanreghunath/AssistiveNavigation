@@ -23,7 +23,6 @@ class Detector(
     private val context: Context,
     private val modelPath: String,
     private val labelPath: String,
-    private val detectorListener: DetectorListener,
 ) {
 
     private var interpreter: Interpreter
@@ -139,11 +138,8 @@ class Detector(
         inferenceTime = SystemClock.uptimeMillis() - inferenceTime
 
         if (bestBoxes == null) {
-            detectorListener.onEmptyDetect()
             return emptyList()
         }
-
-        detectorListener.onDetect(bestBoxes, inferenceTime)
 
         return bestBoxes
     }
@@ -229,10 +225,6 @@ class Detector(
         return intersectionArea / (box1Area + box2Area - intersectionArea)
     }
 
-    interface DetectorListener {
-        fun onEmptyDetect()
-        fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long)
-    }
 
     companion object {
         private const val INPUT_MEAN = 0f
