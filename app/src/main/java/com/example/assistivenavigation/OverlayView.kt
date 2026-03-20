@@ -3,68 +3,64 @@ package com.example.assistivenavigation
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.util.AttributeSet
 import android.view.View
-import kotlin.math.min
 
 class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs) {
 
-    // ---- Detection boxes ----
-    private val boxPaint = Paint().apply {
-        color = Color.GREEN
+    // Solid green → confirmed live detection
+    private val boxPaintTracked = Paint().apply {
+        color       = Color.GREEN
         strokeWidth = 6f
-        style = Paint.Style.STROKE
+        style       = Paint.Style.STROKE
     }
+
+    // Dashed orange → coasting (predicted position, no live detection)
+    private val boxPaintCoasting = Paint().apply {
+        color       = Color.rgb(255, 165, 0)
+        strokeWidth = 6f
+        style       = Paint.Style.STROKE
+        pathEffect  = DashPathEffect(floatArrayOf(20f, 10f), 0f)
+    }
+
     private val textPaint = Paint().apply {
-        color = Color.GREEN
-        textSize = 48f
-        style = Paint.Style.FILL
+        color    = Color.GREEN
+        textSize = 42f
+        style    = Paint.Style.FILL
     }
 
-    // ---- Optical flow circles ----
-
-    /**
-     * Points NOT inside any detection box
-     */
     private val flowPaintBackground = Paint().apply {
-        color = Color.argb(140, 0, 200, 255)
-        style = Paint.Style.FILL
+        color       = Color.argb(140, 0, 200, 255)
+        style       = Paint.Style.FILL
         isAntiAlias = true
     }
 
-    /**
-     * Points inside a detection bounding box
-     */
     private val flowPaintObject = Paint().apply {
-        color = Color.argb(200, 255, 220, 30)
-        style = Paint.Style.FILL
+        color       = Color.argb(200, 255, 220, 30)
+        style       = Paint.Style.FILL
         isAntiAlias = true
     }
 
-    // ---- State ----
-    private var detections: List<BoundingBox> = emptyList()
-    private var flowPoints: List<OpticalFlowProcessor.FlowPoint> = emptyList()
+    private var detections:  List<BoundingBox>                   = emptyList()
+    private var isCoasting:  Boolean                              = false
+    private var flowPoints:  List<OpticalFlowProcessor.FlowPoint> = emptyList()
+    private var imageWidth   = 1
+    private var imageHeight  = 1
+
+    private val MAX_CIRCLE_RADIUS = 28f
+    private val FLOW_SCALE_PIXELS = 20f
+    private val MIN_CIRCLE_RADIUS = 3f
 
     /**
-     * The image dimensions that the flow coordinates are in.
-     * We need these to map from image pixels -> view pixels.
+     * @param coasting pass boxTracker.isCoasting so the overlay can draw
+     *                 an orange dashed box when predicting position.
      */
-    private var imageWidth  = 1
-    private var imageHeight = 1
-
-    /**
-     * A flow magnitude of FLOW_SCALE_PIXELS corresponds to MAX_CIRCLE_RADIUS pixels
-     * on screen.  Tune FLOW_SCALE_PIXELS based on what "fast" looks like in practice
-     * (typically 15–30 px of flow per frame when walking quickly).
-     */
-    private val MAX_CIRCLE_RADIUS  = 28f
-    private val FLOW_SCALE_PIXELS  = 20f
-    private val MIN_CIRCLE_RADIUS  = 3f    // always at least a visible dot
-
-    fun updateDetections(results: List<BoundingBox>) {
+    fun updateDetections(results: List<BoundingBox>, coasting: Boolean = false) {
         detections = results
-        invalidate()   // Redraw the view
+        isCoasting = coasting
+        invalidate()
     }
 
     fun updateFlow(
@@ -80,39 +76,37 @@ class OverlayView(context: Context, attrs: AttributeSet?) : View(context, attrs)
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        // Draw flow circles FIRST so detection boxes appear on top.
         drawFlowCircles(canvas)
         drawDetectionBoxes(canvas)
     }
 
-    // -----------------------------------------------------------------
-
     private fun drawFlowCircles(canvas: Canvas) {
         for (fp in flowPoints) {
-            // Map from image-space coordinates to view-space coordinates.
-            // The view might be a different size than the image (e.g., 1080×1920 view
-            // but 1280×720 image), so we normalise through fractions.
-            val vx = fp.x / imageWidth  * width
-            val vy = fp.y / imageHeight * height
-
-            // Radius is proportional to flow magnitude, clamped to a readable range.
+            val vx     = fp.x / imageWidth  * width
+            val vy     = fp.y / imageHeight * height
             val radius = (fp.magnitude / FLOW_SCALE_PIXELS * MAX_CIRCLE_RADIUS)
                 .coerceIn(MIN_CIRCLE_RADIUS, MAX_CIRCLE_RADIUS)
-
-            val paint = if (fp.detectionIndex >= 0) flowPaintObject else flowPaintBackground
+            val paint  = if (fp.detectionIndex >= 0) flowPaintObject else flowPaintBackground
             canvas.drawCircle(vx, vy, radius, paint)
         }
     }
 
     private fun drawDetectionBoxes(canvas: Canvas) {
+        // Pick paint based on whether we're coasting or tracking
+        val paint = if (isCoasting) boxPaintCoasting else boxPaintTracked
+
         for (det in detections) {
             val left   = det.x1 * width
             val top    = det.y1 * height
             val right  = det.x2 * width
             val bottom = det.y2 * height
-
-            canvas.drawRect(left, top, right, bottom, boxPaint)
-
+            canvas.drawRect(left, top, right, bottom, paint)
+            canvas.drawText(
+                if (isCoasting) "~${det.clsName}" else det.clsName,
+                left + 4f,
+                top - 12f,
+                textPaint
+            )
         }
     }
 }

@@ -6,7 +6,6 @@ import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.media.MediaMetadataRetriever
 import android.os.Bundle
-import android.util.Log
 import android.util.Size
 import android.view.View
 import android.widget.Button
@@ -25,40 +24,46 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import com.example.assistivenavigation.Constants.MODEL_PATH
 import com.example.assistivenavigation.Constants.LABELS_PATH
-import kotlin.math.max
-import kotlin.collections.emptyList
 
 class MainActivity : AppCompatActivity() {
-    private lateinit var previewView: PreviewView
-    private lateinit var startButton: Button
-    private lateinit var uploadButton: Button
-    private lateinit var overlayView: OverlayView
-    private lateinit var debugOverlay: TextView
+
+    // ── Views ─────────────────────────────────────────────────────────────────
+    private lateinit var previewView:    PreviewView
+    private lateinit var startButton:    Button
+    private lateinit var uploadButton:   Button
+    private lateinit var overlayView:    OverlayView
+    private lateinit var debugOverlay:   TextView
     private lateinit var videoFrameView: android.widget.ImageView
-    private var videoRunning = false
-    private var videoTestJob: java.util.concurrent.Future<*>? = null
 
-    private lateinit var detector: Detector
-    private lateinit var audioEngine: AudioEngine
-
+    // ── Pipeline components ───────────────────────────────────────────────────
+    private lateinit var detector:            Detector
+    private lateinit var boxTracker:          BoxTracker
+    private lateinit var audioEngine:         AudioEngine
+    private lateinit var distanceEstimator:   DistanceEstimator
     private lateinit var opticalFlowProcessor: OpticalFlowProcessor
-    private lateinit var imuProcessor: IMUProcessor
+    private lateinit var imuProcessor:        IMUProcessor
 
-    private var smoothedAzimuth = 0f
-    private var lastUIUpdate = 0L
-    private var lastAudioUpdateTime = 0L
+    // ── Session state ─────────────────────────────────────────────────────────
+    private var systemRunning  = false
+    private var audioStarted   = false
+    private var videoRunning   = false
 
-    private var systemRunning = false
-    private var audioStarted = false
+    // ── Audio / UI timing ─────────────────────────────────────────────────────
+    // @Volatile so the camera thread and UI thread both see the latest value.
+    // smoothedAzimuth is only ever written on the camera thread, but accessed
+    // as a snapshot before each runOnUiThread call, so @Volatile is enough.
+    @Volatile private var smoothedAzimuth    = 0f
+    private var lastUIUpdate         = 0L
+    private var lastAudioUpdateTime  = 0L
 
-    private var confirmedFrames = 0
-    private val REQUIRED_CONFIRM_FRAMES = 5
-
+    // ── Concurrency ───────────────────────────────────────────────────────────
     private val cameraExecutor = Executors.newSingleThreadExecutor()
-    private val isProcessing = AtomicBoolean(false)
+    private val isProcessing   = AtomicBoolean(false)
 
-    private var cameraProvider: ProcessCameraProvider? = null
+    private var cameraProvider:  ProcessCameraProvider?          = null
+    private var videoTestJob:    java.util.concurrent.Future<*>? = null
 
+    // ── Permission / file launchers ───────────────────────────────────────────
     private val cameraPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) startCamera() else finish()
@@ -67,14 +72,12 @@ class MainActivity : AppCompatActivity() {
     private val videoPicker =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
             uri ?: return@registerForActivityResult
-            // Resolve to a file path the retriever can open
             val path = getRealPathFromUri(uri)
             if (path != null) startVideoTest(path)
-            else {
-                // Fallback: pass the Uri directly via FileDescriptor
-                startVideoTestFromUri(uri)
-            }
+            else              startVideoTestFromUri(uri)
         }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -82,27 +85,28 @@ class MainActivity : AppCompatActivity() {
         OpenCVLoader.initLocal()
         setContentView(R.layout.activity_main)
 
-        previewView   = findViewById(R.id.previewView)
-        overlayView   = findViewById(R.id.overlayView)
-        debugOverlay  = findViewById(R.id.debugOverlay)
-        startButton   = findViewById(R.id.startButton)
-        uploadButton  = findViewById(R.id.uploadButton)
+        // Bind all views before any logic touches them
+        previewView    = findViewById(R.id.previewView)
+        overlayView    = findViewById(R.id.overlayView)
+        debugOverlay   = findViewById(R.id.debugOverlay)
+        startButton    = findViewById(R.id.startButton)
+        uploadButton   = findViewById(R.id.uploadButton)
+        videoFrameView = findViewById(R.id.videoFrameView)
 
-        detector    = Detector(baseContext, MODEL_PATH, LABELS_PATH)
-        audioEngine = AudioEngine()
+        // Initialise pipeline components
+        detector             = Detector(baseContext, MODEL_PATH, LABELS_PATH)
+        boxTracker           = BoxTracker()
+        audioEngine          = AudioEngine()
         opticalFlowProcessor = OpticalFlowProcessor()
-        imuProcessor = IMUProcessor(this)
+        imuProcessor         = IMUProcessor(this)
+        distanceEstimator    = DistanceEstimator()
 
         previewView.visibility = View.INVISIBLE
-        videoFrameView = findViewById(R.id.videoFrameView)
         debugOverlay.setText(R.string.waiting)
 
         uploadButton.setOnClickListener {
-            if(!videoRunning){
-                videoPicker.launch("video/*")
-            } else {
-                stopVideoTest()
-            }
+            if (!videoRunning) videoPicker.launch("video/*")
+            else               stopVideoTest()
         }
 
         startButton.setOnClickListener {
@@ -111,13 +115,26 @@ class MainActivity : AppCompatActivity() {
                 startButton.setText(R.string.stop)
                 previewView.visibility = View.VISIBLE
                 debugOverlay.text = ""
-                imuProcessor.start()          // start sensor
+                imuProcessor.start()
                 checkPermissionAndStart()
             } else {
                 stopSystem()
             }
         }
     }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (audioStarted) audioEngine.nativeStop()
+        videoTestJob?.cancel(true)
+        imuProcessor.stop()
+        opticalFlowProcessor.release()
+        distanceEstimator.reset()
+        boxTracker.reset()
+        cameraExecutor.shutdown()
+    }
+
+    // ── Camera session ────────────────────────────────────────────────────────
 
     private fun stopSystem() {
         systemRunning = false
@@ -126,14 +143,20 @@ class MainActivity : AppCompatActivity() {
         cameraProvider?.unbindAll()
         previewView.visibility = View.INVISIBLE
         overlayView.updateDetections(emptyList())
-        overlayView.updateFlow(emptyList(), 1, 1)   // clear flow overlay
+        overlayView.updateFlow(emptyList(), 1, 1)
         debugOverlay.setText(R.string.waiting)
-        confirmedFrames = 0
 
         if (audioStarted) { audioEngine.nativeStop(); audioStarted = false }
 
-        imuProcessor.stop()                    // stop sensor
-        opticalFlowProcessor.release()         // free OpenCV Mats
+        imuProcessor.stop()
+        opticalFlowProcessor.release()
+        distanceEstimator.reset()
+        boxTracker.reset()
+
+        // Reset smoothing state so next session starts clean
+        smoothedAzimuth     = 0f
+        lastAudioUpdateTime = 0L
+        lastUIUpdate        = 0L
     }
 
     private fun checkPermissionAndStart() {
@@ -153,12 +176,18 @@ class MainActivity : AppCompatActivity() {
             }
 
             val resolutionSelector = ResolutionSelector.Builder()
-                .setAspectRatioStrategy(AspectRatioStrategy(
-                    AspectRatio.RATIO_16_9,
-                    AspectRatioStrategy.FALLBACK_RULE_AUTO))
-                .setResolutionStrategy(ResolutionStrategy(
-                    Size(1280, 720),
-                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                .setAspectRatioStrategy(
+                    AspectRatioStrategy(
+                        AspectRatio.RATIO_16_9,
+                        AspectRatioStrategy.FALLBACK_RULE_AUTO
+                    )
+                )
+                .setResolutionStrategy(
+                    ResolutionStrategy(
+                        Size(1280, 720),
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                    )
+                )
                 .build()
 
             val imageAnalysis = ImageAnalysis.Builder()
@@ -175,78 +204,127 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    // ── Frame analysis (camera thread) ────────────────────────────────────────
+
     private fun analyzeFrame(image: ImageProxy) {
-        if (!systemRunning) { image.close(); return }
+        if (!systemRunning)                           { image.close(); return }
         if (!isProcessing.compareAndSet(false, true)) { image.close(); return }
 
         val startTime = System.currentTimeMillis()
+        val imgW      = image.width
+        val imgH      = image.height
 
-        val imgW = image.width
-        val imgH = image.height
-
+        // ── 1. Extract grayscale for optical flow (reads Y plane directly,
+        //       no full-colour conversion needed)
         val grayMat = opticalFlowProcessor.extractGray(image)
 
-        val bitmapBuffer = image.toBitmap()
-
-        val matrix = Matrix().apply {
+        // ── 2. Convert to bitmap and rotate to portrait.
+        //       Both bitmaps are recycled immediately after use to avoid
+        //       native memory pressure at 30fps.
+        val rawBitmap = image.toBitmap()
+        val matrix    = Matrix().apply {
             postRotate(image.imageInfo.rotationDegrees.toFloat())
         }
-
         val rotatedBitmap = Bitmap.createBitmap(
-            bitmapBuffer, 0, 0, bitmapBuffer.width, bitmapBuffer.height,
-            matrix, true
+            rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true
         )
-        val detections = detector.detect(rotatedBitmap)
+        rawBitmap.recycle()   // free source; rotatedBitmap is the one we need
 
+        // ── 3. YOLO detection
+        val yoloStartTime = System.currentTimeMillis()
+        val detections    = detector.detect(rotatedBitmap)
+        val inferenceMs   = System.currentTimeMillis() - yoloStartTime
+        rotatedBitmap.recycle()   // done with bitmap
+
+        // ── 4. Optical flow (uses grayMat from step 1)
         val flowResult = opticalFlowProcessor.process(grayMat, detections, imgW, imgH)
-        grayMat.release()
+        grayMat.release()   // MUST release; OpenCV native memory is not GC-managed
+        val totalPipelineMs = System.currentTimeMillis() - startTime
 
-        val inferenceTime = System.currentTimeMillis() - startTime
+        // ── 5. Box tracker — produces a stable confirmed box or null
+        val confirmedDetection = boxTracker.update(detections)
 
-        // ---- Confirmation logic ----
-        val primaryDetection = detections.firstOrNull()
-        if (primaryDetection != null) confirmedFrames++ else confirmedFrames = 0
-        val confirmedDetection =
-            if (confirmedFrames >= REQUIRED_CONFIRM_FRAMES) primaryDetection else null
+        // Snapshot tracker state on the camera thread before handing off to UI thread.
+        // Reading boxTracker.isCoasting / boxTracker.state from the UI thread without
+        // a snapshot would be a data race.
+        val isCoasting   = boxTracker.isCoasting
+        val trackerState = boxTracker.state.name
 
-        // ---- Audio update ----
+        // ── 6. Find the flow magnitude for the TRACKED object specifically.
+        //       objectFlowMagnitudes is keyed by index in the raw detections list.
+        //       When coasting, the predicted box is not in the list at all.
+        val trackedIndex = if (confirmedDetection != null && !isCoasting)
+            detections.indexOf(confirmedDetection)
+        else -1
+
+        val objFlow = if (trackedIndex >= 0)
+            flowResult.objectFlowMagnitudes[trackedIndex] ?: 0f
+        else
+        // Coasting: use whatever flow was computed for the highest-priority
+        // detection as a best-effort estimate
+            flowResult.objectFlowMagnitudes[0] ?: 0f
+
+        val bgFlow = flowResult.backgroundFlowMagnitude
+
+        // ── 7. Audio update (throttled to every 150ms to avoid hammering Oboe)
         if (startTime - lastAudioUpdateTime > 150) {
             if (confirmedDetection != null) {
                 if (!audioStarted) { audioEngine.nativeStart(); audioStarted = true }
 
-                val cx = (confirmedDetection.x1 + confirmedDetection.x2) / 2f
-                val rawAzimuth = (cx * 2f - 1f) * 60f
-                smoothedAzimuth = 0.8f * smoothedAzimuth + 0.2f * rawAzimuth
+                val rawAzimuth  = (confirmedDetection.cx * 2f - 1f) * 90f
+                smoothedAzimuth = 0.85f * smoothedAzimuth + 0.15f * rawAzimuth
 
-                val width = confirmedDetection.x2 - confirmedDetection.x1
-                val distance = max(0.5f, 2.0f - width)
+                val distance = distanceEstimator.estimate(
+                    objectFlowMag     = objFlow,
+                    backgroundFlowMag = bgFlow,
+                    imuSpeed          = imuProcessor.speed,
+                    bboxWidth         = confirmedDetection.w
+                )
                 audioEngine.nativeSetSpatialParams(smoothedAzimuth, distance)
             } else {
                 if (audioStarted) { audioEngine.nativeStop(); audioStarted = false }
+                // Don't let the old smoothed distance bleed into the next detection
+                distanceEstimator.reset()
             }
             lastAudioUpdateTime = startTime
         }
 
-        // ---- UI update ----
+        // Snapshot after the audio block so the UI sees the post-smoothing value
+        val azimuthSnapshot = smoothedAzimuth
+
+        // ── 8. UI update (throttled to every 200ms to reduce main-thread work)
         runOnUiThread {
-            overlayView.updateDetections(detections)
+            overlayView.updateDetections(
+                if (confirmedDetection != null) listOf(confirmedDetection) else emptyList(),
+                isCoasting   // snapshot from camera thread — no race
+            )
             overlayView.updateFlow(flowResult.points, imgW, imgH)
 
             if (System.currentTimeMillis() - lastUIUpdate > 200) {
                 lastUIUpdate = System.currentTimeMillis()
+
                 debugOverlay.text = if (confirmedDetection != null) {
-                    val objFlow = flowResult.objectFlowMagnitudes[0] ?: 0f
                     getString(
                         R.string.debug_detection,
-                        inferenceTime,
+                        inferenceMs,
                         confirmedDetection.cnf,
-                        smoothedAzimuth,
-                        confirmedDetection.x2 - confirmedDetection.x1,
-                        confirmedDetection.y2 - confirmedDetection.y1
-                    ) + "\nflow=%.1fpx spd=%.2fm/s".format(objFlow, imuProcessor.speed)
+                        azimuthSnapshot,
+                        confirmedDetection.w,
+                        confirmedDetection.h
+                    ) + "\nbg=%.1fpx obj=%.1fpx spd=%.2fm/s [%s] pipe=%dms".format(
+                        bgFlow,
+                        objFlow,
+                        imuProcessor.speed,
+                        if (isCoasting) "COAST" else "TRACK",
+                        totalPipelineMs
+                    )
                 } else {
-                    getString(R.string.debug_no_detection, inferenceTime) +
-                            "\nspd=%.2fm/s".format(imuProcessor.speed)
+                    getString(R.string.debug_no_detection, inferenceMs) +
+                            "\nspd=%.2fm/s [%s] pipe=%dms".format(
+                                imuProcessor.speed,
+                                trackerState,   // shows IDLE or CONFIRMING
+                                totalPipelineMs
+                            )
                 }
             }
         }
@@ -254,6 +332,8 @@ class MainActivity : AppCompatActivity() {
         image.close()
         isProcessing.set(false)
     }
+
+    // ── Video test ────────────────────────────────────────────────────────────
 
     private fun startVideoTest(path: String) {
         prepareVideoTest()
@@ -266,16 +346,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun prepareVideoTest() {
-        // Stop camera if running
-        if (systemRunning) stopSystem()
+        if (systemRunning) stopSystem()   // stopSystem() handles its own resets
+
+        // Always reset regardless of whether the camera was running, because the
+        // user may tap UPLOAD after a previous video without going through stopSystem
+        distanceEstimator.reset()
+        boxTracker.reset()
+        smoothedAzimuth     = 0f
+        lastAudioUpdateTime = 0L
+        lastUIUpdate        = 0L
 
         videoRunning = true
         uploadButton.setText(R.string.stop)
         opticalFlowProcessor.release()
-        confirmedFrames = 0
-        previewView.visibility = View.INVISIBLE // no camera preview
-        videoFrameView.visibility = View.VISIBLE
-        debugOverlay.text = "Loading video..."
+        previewView.visibility     = View.INVISIBLE
+        videoFrameView.visibility  = View.VISIBLE
+        debugOverlay.text          = "Loading video..."
     }
 
     private fun stopVideoTest() {
@@ -283,9 +369,15 @@ class MainActivity : AppCompatActivity() {
         videoTestJob?.cancel(true)
         videoTestJob = null
         uploadButton.setText(R.string.upload)
+
         if (audioStarted) { audioEngine.nativeStop(); audioStarted = false }
         opticalFlowProcessor.release()
-        confirmedFrames = 0
+        distanceEstimator.reset()
+        boxTracker.reset()
+        smoothedAzimuth     = 0f
+        lastAudioUpdateTime = 0L
+        lastUIUpdate        = 0L
+
         runOnUiThread {
             videoFrameView.visibility = View.GONE
             overlayView.updateDetections(emptyList())
@@ -296,65 +388,113 @@ class MainActivity : AppCompatActivity() {
 
     private fun runVideoTest(path: String?, uri: android.net.Uri?) {
         val retriever = MediaMetadataRetriever()
-        if (path != null) retriever.setDataSource(path)
-        else              retriever.setDataSource(this, uri)
+        try {
+            if (path != null) retriever.setDataSource(path)
+            else              retriever.setDataSource(this, uri)
+        } catch (e: Exception) {
+            runOnUiThread { debugOverlay.text = "Failed to open video" }
+            retriever.release()
+            return
+        }
 
         val durationMs = retriever
             .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
             ?.toLong() ?: run { retriever.release(); return }
 
-        val frameIntervalMs = 1000L / 30L  // 30fps
-        var timeMs = 0L
+        val frameIntervalMs   = 1000L / 30L
+        var timeMs            = 0L
         var lastFrameRealTime = System.currentTimeMillis()
 
         while (videoRunning && timeMs < durationMs) {
+
             val frame = retriever.getFrameAtTime(
                 timeMs * 1000L,
                 MediaMetadataRetriever.OPTION_CLOSEST
             )
-            if (frame == null) {
-                timeMs += frameIntervalMs
-                continue
-            }
+            if (frame == null) { timeMs += frameIntervalMs; continue }
 
             runOnUiThread { videoFrameView.setImageBitmap(frame) }
 
             val imgW = frame.width
             val imgH = frame.height
 
-            val grayMat = bitmapToGrayMat(frame)
+            // ── Pipeline ────────────────────────────────────────────────────
+            val yoloStart  = System.currentTimeMillis()
+            val grayMat    = bitmapToGrayMat(frame)
             val detections = detector.detect(frame)
+            val inferenceMs = System.currentTimeMillis() - yoloStart
+
             val flowResult = opticalFlowProcessor.process(grayMat, detections, imgW, imgH)
             grayMat.release()
+            val totalMs = System.currentTimeMillis() - yoloStart
 
-            if (detections.firstOrNull() != null) confirmedFrames++ else confirmedFrames = 0
-            val confirmedDetection =
-                if (confirmedFrames >= REQUIRED_CONFIRM_FRAMES) detections.firstOrNull() else null
+            // Note: video frames from MediaMetadataRetriever are managed by the
+            // retriever; do NOT call frame.recycle() here.
 
+            // ── Tracker ─────────────────────────────────────────────────────
+            val confirmedDetection = boxTracker.update(detections)
+            val isCoasting         = boxTracker.isCoasting
+            val trackerState       = boxTracker.state.name
+
+            // ── Flow for tracked object ──────────────────────────────────────
+            val trackedIndex = if (confirmedDetection != null && !isCoasting)
+                detections.indexOf(confirmedDetection) else -1
+            val objFlow = if (trackedIndex >= 0)
+                flowResult.objectFlowMagnitudes[trackedIndex] ?: 0f
+            else
+                flowResult.objectFlowMagnitudes[0] ?: 0f
+            val bgFlow = flowResult.backgroundFlowMagnitude
+
+            // ── Audio ────────────────────────────────────────────────────────
             if (confirmedDetection != null) {
                 if (!audioStarted) { audioEngine.nativeStart(); audioStarted = true }
-                val cx = (confirmedDetection.x1 + confirmedDetection.x2) / 2f
-                val rawAzimuth = (cx * 2f - 1f) * 60f
-                smoothedAzimuth = 0.8f * smoothedAzimuth + 0.2f * rawAzimuth
-                val width = confirmedDetection.x2 - confirmedDetection.x1
-                audioEngine.nativeSetSpatialParams(smoothedAzimuth, maxOf(0.5f, 2.0f - width))
+
+                val rawAzimuth  = (confirmedDetection.cx * 2f - 1f) * 90f
+                smoothedAzimuth = 0.85f * smoothedAzimuth + 0.15f * rawAzimuth
+
+                val distance = distanceEstimator.estimate(
+                    objectFlowMag     = objFlow,
+                    backgroundFlowMag = bgFlow,
+                    imuSpeed          = imuProcessor.speed,
+                    bboxWidth         = confirmedDetection.w
+                )
+                audioEngine.nativeSetSpatialParams(smoothedAzimuth, distance)
             } else {
                 if (audioStarted) { audioEngine.nativeStop(); audioStarted = false }
+                distanceEstimator.reset()
             }
 
+            val azimuthSnapshot = smoothedAzimuth
+
+            // ── UI ───────────────────────────────────────────────────────────
             runOnUiThread {
-                overlayView.updateDetections(detections)
+                overlayView.updateDetections(
+                    if (confirmedDetection != null) listOf(confirmedDetection) else emptyList(),
+                    isCoasting
+                )
                 overlayView.updateFlow(flowResult.points, imgW, imgH)
+
                 debugOverlay.text = if (confirmedDetection != null)
-                    "${confirmedDetection.clsName} az=%.1f°".format(smoothedAzimuth)
+                    "${confirmedDetection.clsName} az=%.1f° obj=%.1fpx bg=%.1fpx [%s] %dms/%dms"
+                        .format(
+                            azimuthSnapshot,
+                            objFlow,
+                            bgFlow,
+                            if (isCoasting) "COAST" else "TRACK",
+                            inferenceMs,
+                            totalMs
+                        )
                 else
-                    "no detection · frame ${flowResult.frameCount}"
+                    "no detection · $trackerState · frame ${flowResult.frameCount} · ${totalMs}ms"
             }
 
-            val now = System.currentTimeMillis()
-            val elapsed = now - lastFrameRealTime
+            // ── Frame pacing ─────────────────────────────────────────────────
+            // Skip frames if processing took longer than one frame interval so
+            // the video doesn't fall further and further behind real time.
+            val now          = System.currentTimeMillis()
+            val elapsed      = now - lastFrameRealTime
             val framesToSkip = (elapsed / frameIntervalMs).coerceAtLeast(1)
-            timeMs += frameIntervalMs * framesToSkip
+            timeMs          += frameIntervalMs * framesToSkip
             lastFrameRealTime = now
         }
 
@@ -362,7 +502,14 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread { if (videoRunning) stopVideoTest() }
     }
 
-    private fun bitmapToGrayMat(bitmap: android.graphics.Bitmap): org.opencv.core.Mat {
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Converts a Bitmap to a single-channel grayscale OpenCV Mat.
+     * Used only in video-test mode; the camera path uses extractGray() directly
+     * from the YUV Y-plane, which is faster.sssssssss
+     */
+    private fun bitmapToGrayMat(bitmap: Bitmap): org.opencv.core.Mat {
         val rgba = org.opencv.core.Mat()
         org.opencv.android.Utils.bitmapToMat(bitmap, rgba)
         val gray = org.opencv.core.Mat()
@@ -371,7 +518,11 @@ class MainActivity : AppCompatActivity() {
         return gray
     }
 
-    // Resolves content:// Uri to a real file path where possible
+    /**
+     * Resolves a content:// Uri to a real filesystem path where the OS allows it.
+     * Returns null if the Uri cannot be resolved (e.g. cloud-backed files), in
+     * which case the caller falls back to setDataSource(Uri).
+     */
     private fun getRealPathFromUri(uri: android.net.Uri): String? {
         var path: String? = null
         val projection = arrayOf(android.provider.MediaStore.Video.Media.DATA)
@@ -383,14 +534,4 @@ class MainActivity : AppCompatActivity() {
         }
         return path
     }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        if (audioStarted) audioEngine.nativeStop()
-        videoTestJob?.cancel(true)
-        imuProcessor.stop()
-        opticalFlowProcessor.release()
-        cameraExecutor.shutdown()
-    }
-
 }

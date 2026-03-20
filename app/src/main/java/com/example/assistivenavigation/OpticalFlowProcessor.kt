@@ -88,14 +88,21 @@ class OpticalFlowProcessor {
     /**
      * Everything the caller needs from one processed frame.
      *
-     * @param points                all successfully tracked FlowPoints
-     * @param objectFlowMagnitudes  map of detectionIndex -> average flow magnitude
-     *                              for points inside that bounding box
-     * @param frameCount            ever-increasing frame counter (useful for timing)
+     * @param points                    all successfully tracked FlowPoints
+     *
+     * @param objectFlowMagnitudes      map of detectionIndex -> average flow magnitude
+     *                                  for points inside that bounding box
+     *
+     * @param backgroundFlowMagnitude   average magnitude of points not inside any bounding box
+     *                                  This represents how fast the camera itself is moving
+     *                                  through the scene (ego-motion). It is used by DistanceEstimator.
+     *
+     * @param frameCount                ever-increasing frame counter (useful for timing)
      */
     data class FlowResult(
         val points: List<FlowPoint>,
         val objectFlowMagnitudes: Map<Int, Float>,
+        val backgroundFlowMagnitude: Float,
         val frameCount: Int
     )
 
@@ -189,7 +196,7 @@ class OpticalFlowProcessor {
         if (prevGray == null) {
             prevGray = gray.clone()
             prevPoints = detectCorners(gray)
-            return FlowResult(emptyList(), emptyMap(), frameCount)
+            return FlowResult(emptyList(), emptyMap(), 0f, frameCount)
         }
 
         // ---- Re-detect corners ----
@@ -207,7 +214,7 @@ class OpticalFlowProcessor {
         if (pts == null || pts.rows() == 0) {
             // No corners to track -> store current frame and bail.
             updatePrevFrame(gray, null)
-            return FlowResult(emptyList(), emptyMap(), frameCount)
+            return FlowResult(emptyList(), emptyMap(), 0f, frameCount)
         }
 
         // ---- Lucas-Kanade Pyramidal Optical Flow ----
@@ -291,6 +298,13 @@ class OpticalFlowProcessor {
             }
         }
 
+        // ----- Background flow (points outside all boxes) ----
+        // This is the camera's ego-motion magnitude in original pixels/frame.
+        val bgPoints = flowPoints.filter { it.detectionIndex < 0 }
+        val backgroundFlow = if (bgPoints.isNotEmpty())
+            bgPoints.map { it.magnitude }.average().toFloat()
+        else 0f
+
         // ---- Update state for next frame ----
         val nextCorners = if (goodNext.size >= MIN_TRACKED) {
             MatOfPoint2f(*goodNext.toTypedArray())
@@ -304,7 +318,7 @@ class OpticalFlowProcessor {
         status.release()
         err.release()
 
-        return FlowResult(flowPoints, objectFlows, frameCount)
+        return FlowResult(flowPoints, objectFlows, backgroundFlow, frameCount)
     }
 
     /** Must be called when the screen is turned off or the user stops the session. */
